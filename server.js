@@ -11,7 +11,7 @@ const app = express();
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: {
-    fileSize: 8 * 1024 * 1024, // עד 8MB
+    fileSize: 8 * 1024 * 1024,
   },
 });
 
@@ -44,7 +44,20 @@ app.post("/analyze-meal", upload.single("image"), async (req, res) => {
     }
 
     const base64Image = req.file.buffer.toString("base64");
-    const mimeType = req.file.mimetype || "image/jpeg";
+
+    let mimeType = req.file.mimetype;
+
+    if (!mimeType || mimeType === "application/octet-stream") {
+      const fileName = req.file.originalname?.toLowerCase() || "";
+
+      if (fileName.endsWith(".png")) {
+        mimeType = "image/png";
+      } else if (fileName.endsWith(".webp")) {
+        mimeType = "image/webp";
+      } else {
+        mimeType = "image/jpeg";
+      }
+    }
 
     const response = await client.responses.create({
       model: "gpt-5.4-mini",
@@ -58,6 +71,8 @@ app.post("/analyze-meal", upload.single("image"), async (req, res) => {
                 "Analyze the meal in this image. Return ONLY valid JSON, no markdown. " +
                 "Estimate calories, protein grams, fat grams and carbs grams. " +
                 "The response language should be Hebrew. " +
+                "Use realistic nutrition estimation. " +
+                "If quantities are unclear, estimate reasonably and lower confidence. " +
                 "Use this exact JSON structure: " +
                 '{"meal_name":"string","calories":0,"protein":0,"fat":0,"carbs":0,"confidence":"low|medium|high","notes":"string"}',
             },
@@ -73,6 +88,7 @@ app.post("/analyze-meal", upload.single("image"), async (req, res) => {
     const text = response.output_text ?? "";
 
     let parsed;
+
     try {
       parsed = JSON.parse(text);
     } catch (error) {
