@@ -27,12 +27,10 @@ function detectImageMimeType(buffer, originalName = "") {
     return "image/jpeg";
   }
 
-  // JPEG: FF D8 FF
   if (buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) {
     return "image/jpeg";
   }
 
-  // PNG: 89 50 4E 47
   if (
     buffer[0] === 0x89 &&
     buffer[1] === 0x50 &&
@@ -42,7 +40,6 @@ function detectImageMimeType(buffer, originalName = "") {
     return "image/png";
   }
 
-  // WEBP: RIFF....WEBP
   const riff = buffer.toString("ascii", 0, 4);
   const webp = buffer.toString("ascii", 8, 12);
   if (riff === "RIFF" && webp === "WEBP") {
@@ -60,11 +57,68 @@ function detectImageMimeType(buffer, originalName = "") {
   return "image/jpeg";
 }
 
+function toNumber(value) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return Math.round(value);
+  }
+
+  if (typeof value === "string") {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) {
+      return Math.round(parsed);
+    }
+  }
+
+  return 0;
+}
+
+function normalizeAiResult(raw) {
+  const items = Array.isArray(raw.items)
+    ? raw.items.map((item) => ({
+        name: String(item.name || "רכיב לא מזוהה"),
+        quantity:
+          typeof item.quantity === "number"
+            ? item.quantity
+            : Number(item.quantity) || 1,
+        unit: String(item.unit || "מנה"),
+        calories: toNumber(item.calories),
+        protein: toNumber(item.protein),
+        fat: toNumber(item.fat),
+        carbs: toNumber(item.carbs),
+        notes: String(item.notes || ""),
+      }))
+    : [];
+
+  const totalsFromItems = items.reduce(
+    (sum, item) => {
+      sum.calories += item.calories;
+      sum.protein += item.protein;
+      sum.fat += item.fat;
+      sum.carbs += item.carbs;
+      return sum;
+    },
+    { calories: 0, protein: 0, fat: 0, carbs: 0 }
+  );
+
+  return {
+    meal_name: String(raw.meal_name || "ארוחה מנותחת"),
+    calories: toNumber(raw.calories) || totalsFromItems.calories,
+    protein: toNumber(raw.protein) || totalsFromItems.protein,
+    fat: toNumber(raw.fat) || totalsFromItems.fat,
+    carbs: toNumber(raw.carbs) || totalsFromItems.carbs,
+    confidence: ["low", "medium", "high"].includes(raw.confidence)
+      ? raw.confidence
+      : "medium",
+    notes: String(raw.notes || "הערכה תזונתית לפי צילום. מומלץ לאמת כמויות."),
+    items,
+  };
+}
+
 app.get("/", (req, res) => {
   res.json({
     status: "ok",
     service: "nutrition-ai-server",
-    version: "mime-fix-2",
+    version: "food-items-v1",
   });
 });
 
@@ -105,12 +159,13 @@ app.post("/analyze-meal", upload.single("image"), async (req, res) => {
               type: "input_text",
               text:
                 "Analyze the meal in this image. Return ONLY valid JSON, no markdown. " +
-                "Estimate calories, protein grams, fat grams and carbs grams. " +
                 "The response language should be Hebrew. " +
-                "Use realistic nutrition estimation. " +
-                "If quantities are unclear, estimate reasonably and lower confidence. " +
+                "Break the meal into separate visible food items. " +
+                "For each item estimate quantity, unit, calories, protein grams, fat grams, carbs grams. " +
+                "Use realistic nutrition estimation. If quantities are unclear, estimate reasonably and lower confidence. " +
+                "The total meal values must equal approximately the sum of item values. " +
                 "Use this exact JSON structure: " +
-                '{"meal_name":"string","calories":0,"protein":0,"fat":0,"carbs":0,"confidence":"low|medium|high","notes":"string"}',
+                '{"meal_name":"string","calories":0,"protein":0,"fat":0,"carbs":0,"confidence":"low|medium|high","notes":"string","items":[{"name":"string","quantity":1,"unit":"string","calories":0,"protein":0,"fat":0,"carbs":0,"notes":"string"}]}',
             },
             {
               type: "input_image",
@@ -134,7 +189,9 @@ app.post("/analyze-meal", upload.single("image"), async (req, res) => {
       });
     }
 
-    return res.json(parsed);
+    const normalized = normalizeAiResult(parsed);
+
+    return res.json(normalized);
   } catch (error) {
     console.error(error);
 
