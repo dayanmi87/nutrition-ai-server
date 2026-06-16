@@ -22,10 +22,49 @@ const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
+function detectImageMimeType(buffer, originalName = "") {
+  if (!buffer || buffer.length < 12) {
+    return "image/jpeg";
+  }
+
+  // JPEG: FF D8 FF
+  if (buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) {
+    return "image/jpeg";
+  }
+
+  // PNG: 89 50 4E 47
+  if (
+    buffer[0] === 0x89 &&
+    buffer[1] === 0x50 &&
+    buffer[2] === 0x4e &&
+    buffer[3] === 0x47
+  ) {
+    return "image/png";
+  }
+
+  // WEBP: RIFF....WEBP
+  const riff = buffer.toString("ascii", 0, 4);
+  const webp = buffer.toString("ascii", 8, 12);
+  if (riff === "RIFF" && webp === "WEBP") {
+    return "image/webp";
+  }
+
+  const fileName = originalName.toLowerCase();
+
+  if (fileName.endsWith(".png")) return "image/png";
+  if (fileName.endsWith(".webp")) return "image/webp";
+  if (fileName.endsWith(".jpg") || fileName.endsWith(".jpeg")) {
+    return "image/jpeg";
+  }
+
+  return "image/jpeg";
+}
+
 app.get("/", (req, res) => {
   res.json({
     status: "ok",
     service: "nutrition-ai-server",
+    version: "mime-fix-2",
   });
 });
 
@@ -44,20 +83,17 @@ app.post("/analyze-meal", upload.single("image"), async (req, res) => {
     }
 
     const base64Image = req.file.buffer.toString("base64");
+    const mimeType = detectImageMimeType(
+      req.file.buffer,
+      req.file.originalname
+    );
 
-    let mimeType = req.file.mimetype;
-
-    if (!mimeType || mimeType === "application/octet-stream") {
-      const fileName = req.file.originalname?.toLowerCase() || "";
-
-      if (fileName.endsWith(".png")) {
-        mimeType = "image/png";
-      } else if (fileName.endsWith(".webp")) {
-        mimeType = "image/webp";
-      } else {
-        mimeType = "image/jpeg";
-      }
-    }
+    console.log("Uploaded file:", {
+      originalname: req.file.originalname,
+      multerMimeType: req.file.mimetype,
+      detectedMimeType: mimeType,
+      size: req.file.size,
+    });
 
     const response = await client.responses.create({
       model: "gpt-5.4-mini",
