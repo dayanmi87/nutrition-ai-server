@@ -1,0 +1,17 @@
+{
+  "name": "nutrition-ai-server",
+  "version": "1.0.0",
+  "description": "AI meal analyzer server for Flutter nutrition app",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.3",
+    "express": "^5.2.1",
+    "multer": "^2.0.2",
+    "openai": "^6.14.0"
+  }
+}
