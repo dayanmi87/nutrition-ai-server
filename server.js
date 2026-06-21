@@ -157,6 +157,60 @@ const FOOD_DB = [
     per100g: { calories: 132, protein: 29, carbs: 0, fat: 1 },
     unitGrams: { "גרם": 1, "גרמים": 1, "קופסה": 112, "מנה": 112 },
   },
+  {
+    keys: ["פיתה", "פיתה לבנה", "pita"],
+    english: "pita bread",
+    per100g: { calories: 275, protein: 9, carbs: 56, fat: 1.2 },
+    unitGrams: { "יחידה": 100, "חצי": 50, "גרם": 1, "גרמים": 1 },
+  },
+  {
+    keys: ["חומוס", "hummus"],
+    english: "hummus",
+    per100g: { calories: 250, protein: 8, carbs: 20, fat: 16 },
+    unitGrams: { "כף": 15, "כפות": 15, "מנה": 100, "גרם": 1, "גרמים": 1 },
+  },
+  {
+    keys: ["טחינה", "tahini"],
+    english: "tahini",
+    per100g: { calories: 595, protein: 17, carbs: 21, fat: 53 },
+    unitGrams: { "כף": 15, "כפות": 15, "כפית": 5, "מנה": 30, "גרם": 1, "גרמים": 1 },
+  },
+  {
+    keys: ["פלאפל", "falafel"],
+    english: "falafel",
+    perUnit: { calories: 60, protein: 2.5, carbs: 6, fat: 3.5 },
+    unitGrams: { "כדור": 1, "כדורים": 1, "יחידה": 1, "מנה": 5 },
+  },
+  {
+    keys: ["קוטג", "קוטג׳", "קוטג'", "cottage"],
+    english: "cottage cheese",
+    per100g: { calories: 95, protein: 11, carbs: 3, fat: 5 },
+    unitGrams: { "גרם": 1, "גרמים": 1, "גביע": 250, "כף": 15, "כפות": 15 },
+  },
+  {
+    keys: ["גבינה צהובה", "yellow cheese", "cheese slice"],
+    english: "cheese",
+    per100g: { calories: 330, protein: 25, carbs: 2, fat: 25 },
+    unitGrams: { "פרוסה": 22, "פרוסות": 22, "גרם": 1, "גרמים": 1 },
+  },
+  {
+    keys: ["חזה עוף", "chicken breast"],
+    english: "chicken breast cooked",
+    per100g: { calories: 165, protein: 31, carbs: 0, fat: 3.6 },
+    unitGrams: { "גרם": 1, "גרמים": 1, "מנה": 150, "יחידה": 150 },
+  },
+  {
+    keys: ["סלט ישראלי", "סלט ירקות", "israeli salad", "vegetable salad"],
+    english: "vegetable salad",
+    per100g: { calories: 35, protein: 1, carbs: 6, fat: 0.5 },
+    unitGrams: { "גרם": 1, "גרמים": 1, "קערה": 250, "מנה": 200, "כף": 15, "כפות": 15 },
+  },
+  {
+    keys: ["קרקרים", "קרקר", "cracker", "crackers"],
+    english: "crackers",
+    per100g: { calories: 430, protein: 9, carbs: 72, fat: 12 },
+    unitGrams: { "יחידה": 8, "קרקר": 8, "קרקרים": 8, "גרם": 1, "גרמים": 1 },
+  },
 ];
 
 function findFoodRecord(name) {
@@ -514,7 +568,7 @@ app.get("/", (req, res) => {
   res.json({
     status: "ok",
     service: "nutrition-ai-server",
-    version: "verification-v3-usda",
+    version: "chatgpt-image-israel-db-v4",
     usda_enabled: Boolean(FDC_API_KEY),
     endpoints: ["/analyze-meal", "/analyze-text-meal"],
   });
@@ -547,9 +601,13 @@ app.post("/analyze-meal", upload.single("image"), async (req, res) => {
             {
               type: "input_text",
               text:
-                "Analyze the meal in this image. Return ONLY valid JSON, no markdown. " +
-                "The response language should be Hebrew. Break the meal into separate visible food items. " +
-                "Focus especially on food names, quantity and unit. Nutrition values can be rough because the server will verify them. " +
+                "אתה מנוע ניתוח תזונתי כמו בשיחת ChatGPT רגילה. נתח את התמונה בזהירות. החזר JSON תקין בלבד, בלי Markdown. " +
+                "זהה את כל רכיבי המנה הנראים בתמונה, כולל תוספות, רטבים, לחם, שמן, אגוזים, גבינות וחלבונים. " +
+                "הדגש החשוב ביותר: הערך כמות לכל רכיב ביחידות שימושיות בישראל: גרם, כפות, כפיות, פרוסות, יחידות, סקופ, קערה או מנה. " +
+                "אם אינך בטוח בכמות, תן אומדן שמרני אך מציאותי וכתוב בהערות מה הנחת. " +
+                "לאחר זיהוי הרכיבים, הערך קלוריות, חלבון, שומן ופחמימות לכל רכיב. " +
+                "שים לב במיוחד לאבקת חלבון: סקופ רגיל הוא לרוב כ-30 גרם עם כ-24 גרם חלבון וכ-120 קלוריות. " +
+                "התשובה בעברית. הערכים הכוללים חייבים להיות סכום הרכיבים. " +
                 "Use this exact JSON structure: " +
                 '{"meal_name":"string","calories":0,"protein":0,"fat":0,"carbs":0,"confidence":"low|medium|high","notes":"string","items":[{"name":"string","quantity":1,"unit":"string","calories":0,"protein":0,"fat":0,"carbs":0,"notes":"string"}]}',
             },
