@@ -3,6 +3,9 @@ import cors from "cors";
 import multer from "multer";
 import OpenAI from "openai";
 import dotenv from "dotenv";
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
 
 dotenv.config();
 
@@ -26,6 +29,16 @@ const FDC_API_KEY = process.env.FDC_API_KEY || "";
 const OPEN_FOOD_FACTS_USER_AGENT =
   process.env.OPEN_FOOD_FACTS_USER_AGENT ||
   "nutrition-app/1.0 (contact: nutrition-app-user)";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const DATA_DIR = path.join(__dirname, "data");
+
+const EXTERNAL_DB_FILES = [
+  { id: "israeli_national_db", label: "מאגר התזונה הלאומי הישראלי", fileNames: ["israeli_national_db.csv", "israeli_national_db.json"] },
+  { id: "foodsdictionary", label: "FoodsDictionary", fileNames: ["foodsdictionary.csv", "foodsdictionary.json"] },
+  { id: "tzameret", label: "צמרת", fileNames: ["tzameret.csv", "tzameret.json"] },
+];
 
 function requireApiKey(res) {
   if (!process.env.OPENAI_API_KEY) {
@@ -95,6 +108,268 @@ function normalizeText(value) {
     .replace(/\s+/g, " ")
     .trim();
 }
+
+
+function parseCsvLine(line) {
+  const result = [];
+  let current = "";
+  let insideQuotes = false;
+
+  for (let i = 0; i < line.length; i++) {
+    const char = line[i];
+    const next = line[i + 1];
+
+    if (char === '"' && insideQuotes && next === '"') {
+      current += '"';
+      i++;
+      continue;
+    }
+
+    if (char === '"') {
+      insideQuotes = !insideQuotes;
+      continue;
+    }
+
+    if (char === "," && !insideQuotes) {
+      result.push(current.trim());
+      current = "";
+      continue;
+    }
+
+    result.push;
+    current += char;
+  }
+
+  result.push(current.trim());
+  return result;
+}
+
+function parseCsv(text) {
+  const normalized = String(text || "").replace(/^\uFEFF/, "");
+  const lines = normalized
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  if (lines.length < 2) return [];
+
+  const headers = parseCsvLine(lines[0]).map((h) => normalizeText(h));
+
+  return lines.slice(1).map((line) => {
+    const values = parseCsvLine(line);
+    const row = {};
+
+    headers.forEach((header, index) => {
+      row[header] = values[index] ?? "";
+    });
+
+    return row;
+  });
+}
+
+function readJsonOrCsv(filePath) {
+  if (!fs.existsSync(filePath)) return [];
+
+  const raw = fs.readFileSync(filePath, "utf8");
+
+  if (filePath.toLowerCase().endsWith(".json")) {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : parsed.items || parsed.foods || [];
+  }
+
+  return parseCsv(raw);
+}
+
+function getRowValue(row, candidates) {
+  const normalizedCandidates = candidates.map(normalizeText);
+
+  for (const key of Object.keys(row)) {
+    const normalizedKey = normalizeText(key);
+
+    if (normalizedCandidates.includes(normalizedKey)) {
+      return row[key];
+    }
+  }
+
+  for (const key of Object.keys(row)) {
+    const normalizedKey = normalizeText(key);
+
+    if (normalizedCandidates.some((candidate) => normalizedKey.includes(candidate))) {
+      return row[key];
+    }
+  }
+
+  return "";
+}
+
+function numberFromRow(row, candidates) {
+  const value = getRowValue(row, candidates);
+  if (typeof value === "number") return value;
+
+  const cleaned = String(value || "")
+    .replace(",", ".")
+    .replace(/[^\d.-]/g, "");
+
+  const parsed = Number(cleaned);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function normalizeExternalFoodRow(row, sourceId, sourceLabel) {
+  const name =
+    getRowValue(row, [
+      "name",
+      "food_name",
+      "שם",
+      "שם מזון",
+      "שם מצרך",
+      "שם מוצר",
+      "מצרך",
+      "מוצר",
+      "תיאור",
+      "description",
+      "hebrew_name",
+      "שם בעברית",
+    ]) || "";
+
+  const englishName =
+    getRowValue(row, ["english_name", "name_en", "שם באנגלית", "english", "description_en"]) || "";
+
+  if (!name && !englishName) return null;
+
+  const calories =
+    numberFromRow(row, [
+      "calories",
+      "energy_kcal",
+      "kcal",
+      "אנרגיה",
+      "קלוריות",
+      "קילוקלוריות",
+      "energy",
+      "energy kcal",
+    ]) || 0;
+
+  const protein = numberFromRow(row, ["protein", "חלבון", "protein_g", "חלבון גרם"]) || 0;
+  const carbs =
+    numberFromRow(row, [
+      "carbohydrate",
+      "carbs",
+      "פחמימות",
+      "carbohydrate_g",
+      "פחמימות זמינות",
+    ]) || 0;
+  const fat = numberFromRow(row, ["fat", "שומן", "total_fat", "שומן כולל", "lipid"]) || 0;
+
+  if (!calories && !protein && !carbs && !fat) return null;
+
+  return {
+    sourceId,
+    sourceLabel,
+    name: String(name || englishName).trim(),
+    englishName: String(englishName || "").trim(),
+    per100g: {
+      calories,
+      protein,
+      carbs,
+      fat,
+    },
+    raw: row,
+  };
+}
+
+function loadExternalIsraeliDatabases() {
+  const records = [];
+  const stats = {};
+
+  for (const db of EXTERNAL_DB_FILES) {
+    stats[db.id] = 0;
+
+    for (const fileName of db.fileNames) {
+      const filePath = path.join(DATA_DIR, fileName);
+
+      if (!fs.existsSync(filePath)) continue;
+
+      try {
+        const rows = readJsonOrCsv(filePath);
+
+        for (const row of rows) {
+          const normalized = normalizeExternalFoodRow(row, db.id, db.label);
+          if (normalized) {
+            records.push(normalized);
+            stats[db.id]++;
+          }
+        }
+      } catch (error) {
+        console.error(`Failed loading ${filePath}`, error.message);
+      }
+    }
+  }
+
+  console.log("External Israeli nutrition DB stats:", stats);
+  return { records, stats };
+}
+
+const EXTERNAL_ISRAELI_DB = loadExternalIsraeliDatabases();
+
+function scoreFoodNameMatch(query, candidate) {
+  const q = normalizeText(query);
+  const c = normalizeText(candidate);
+
+  if (!q || !c) return 0;
+  if (q === c) return 100;
+  if (c.includes(q)) return 85;
+  if (q.includes(c)) return 75;
+
+  const qTokens = q.split(" ").filter((token) => token.length > 1);
+  const cTokens = new Set(c.split(" ").filter((token) => token.length > 1));
+
+  if (qTokens.length === 0) return 0;
+
+  const matched = qTokens.filter((token) => cTokens.has(token)).length;
+  return Math.round((matched / qTokens.length) * 70);
+}
+
+function findExternalIsraeliRecord(name) {
+  let best = null;
+  let bestScore = 0;
+
+  for (const record of EXTERNAL_ISRAELI_DB.records) {
+    const score = Math.max(
+      scoreFoodNameMatch(name, record.name),
+      scoreFoodNameMatch(name, record.englishName)
+    );
+
+    if (score > bestScore) {
+      best = record;
+      bestScore = score;
+    }
+  }
+
+  if (bestScore < 60) return null;
+
+  return { ...best, score: bestScore };
+}
+
+function calcExternalIsraeliFoodItem(item) {
+  const record = findExternalIsraeliRecord(item.name);
+  if (!record) return null;
+
+  const grams = gramsFromItem(item, findFoodRecord(item.name)) ?? normalizeQuantity(item.quantity);
+  const multiplier = grams / 100;
+
+  return {
+    name: String(item.name || record.name || "רכיב מזון"),
+    quantity: normalizeQuantity(item.quantity),
+    unit: String(item.unit || "גרם"),
+    calories: Math.round(record.per100g.calories * multiplier),
+    protein: Math.round(record.per100g.protein * multiplier),
+    fat: Math.round(record.per100g.fat * multiplier),
+    carbs: Math.round(record.per100g.carbs * multiplier),
+    notes: `${record.sourceLabel}: ${record.name}; התאמה ${record.score}%; כ-${Math.round(grams)} גרם`,
+    source: record.sourceId,
+    confidence: record.score >= 80 ? "high" : "medium",
+  };
+}
+
 
 const FOOD_DB = [
   {
@@ -495,21 +770,33 @@ async function verifyAndCalculateItems(items) {
       notes: String(item.notes || ""),
     };
 
-    const internal = calcKnownFoodItem(simplified);
-    if (internal) {
-      verified.push(sanityCheckItem(internal));
-      continue;
-    }
-
+    // v7 accuracy rule: internet databases first.
+    // 1) Open Food Facts for packaged/branded products and snacks.
+    // 2) Israeli external CSV/JSON databases: National Nutrition DB, FoodsDictionary, Tzameret.
+    // 3) USDA FoodData Central for generic foods and raw/cooked ingredients.
+    // 4) Internal Israeli/common-food database as a stable fallback.
+    // 5) AI only if all data sources fail.
     const openFoodFacts = await calcOpenFoodFactsItem(simplified);
     if (openFoodFacts) {
       verified.push(sanityCheckItem(openFoodFacts));
       continue;
     }
 
+    const externalIsraeli = calcExternalIsraeliFoodItem(simplified);
+    if (externalIsraeli) {
+      verified.push(sanityCheckItem(externalIsraeli));
+      continue;
+    }
+
     const usda = await calcUsdaFoodItem(simplified);
     if (usda) {
       verified.push(sanityCheckItem(usda));
+      continue;
+    }
+
+    const internal = calcKnownFoodItem(simplified);
+    if (internal) {
+      verified.push(sanityCheckItem(internal));
       continue;
     }
 
@@ -527,8 +814,9 @@ async function verifyAndCalculateItems(items) {
               type: "input_text",
               text:
                 "You are a strict nutrition calculation engine. Return ONLY valid JSON, no markdown. " +
-                "Estimate ONLY these unresolved food items. Keep quantities and units exactly as given. " +
-                "Do not underestimate protein powder. Use realistic nutrition values. " +
+                "Estimate ONLY these unresolved food items because Open Food Facts and USDA did not return usable nutrition data. " +
+                "Keep quantities and units exactly as given. Do not invent branded-product data if uncertain. " +
+                "Do not underestimate protein powder. Use realistic nutrition values and set confidence to low/medium when uncertain. " +
                 "Items JSON: " +
                 JSON.stringify(needsAi) +
                 "\nUse this exact JSON structure: " +
@@ -655,8 +943,9 @@ app.get("/", (req, res) => {
   res.json({
     status: "ok",
     service: "nutrition-ai-server",
-    version: "metric-meal-v6-off-usda",
+    version: "metric-meal-v8-israeli-sources",
     usda_enabled: Boolean(FDC_API_KEY),
+    israeli_sources: EXTERNAL_ISRAELI_DB.stats,
     endpoints: ["/analyze-meal", "/analyze-text-meal"],
   });
 });
@@ -715,7 +1004,7 @@ app.post("/analyze-meal", upload.single("image"), async (req, res) => {
       buildMealResultFromItems(
         normalized.meal_name,
         verifiedItems,
-        "תמונה נותחה עם AI; הערכים אומתו מול מאגר פנימי/Open Food Facts/USDA/AI לפי זמינות."
+        "תמונה נותחה עם AI לזיהוי רכיבים וכמויות; הערכים נבדקו קודם ברשת מול Open Food Facts ו-USDA, ורק לאחר מכן מאגר פנימי/AI."
       )
     );
   } catch (error) {
@@ -744,7 +1033,7 @@ app.post("/analyze-text-meal", async (req, res) => {
       buildMealResultFromItems(
         mealName,
         verifiedItems,
-        "מאכלים מוכרים חושבו לפי מאגר פנימי; מוצרים ארוזים מול Open Food Facts; השאר מול USDA או AI."
+        "כל רכיב נבדק קודם ברשת מול Open Food Facts ו-USDA; רק אם אין נתון תקין נעשה שימוש במאגר פנימי או AI."
       )
     );
   } catch (error) {
