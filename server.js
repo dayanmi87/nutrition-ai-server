@@ -211,6 +211,19 @@ const FOOD_DB = [
     per100g: { calories: 430, protein: 9, carbs: 72, fat: 12 },
     unitGrams: { "יחידה": 8, "קרקר": 8, "קרקרים": 8, "גרם": 1, "גרמים": 1 },
   },
+
+  {
+    keys: ["אוראו", "עוגיית אוראו", "oreo", "oreo cookie", "oreo cookies"],
+    english: "oreo cookies",
+    perUnit: { calories: 53, protein: 0.7, carbs: 8.3, fat: 2.3 },
+    unitGrams: { "עוגייה": 1, "עוגיה": 1, "יחידה": 1, "מנה": 3 },
+  },
+  {
+    keys: ["ביסקוויט", "biscuit", "cookie", "cookies"],
+    english: "cookies",
+    per100g: { calories: 480, protein: 6, carbs: 70, fat: 20 },
+    unitGrams: { "עוגייה": 11, "עוגיה": 11, "יחידה": 11, "גרם": 1, "גרמים": 1 },
+  },
 ];
 
 function findFoodRecord(name) {
@@ -326,6 +339,74 @@ async function translateFoodNameToEnglish(name) {
   }
 }
 
+
+async function calcOpenFoodFactsItem(item) {
+  const originalName = String(item.name || "").trim();
+  if (!originalName) return null;
+
+  const query = await translateFoodNameToEnglish(originalName);
+  const url = new URL("https://world.openfoodfacts.org/cgi/search.pl");
+  url.searchParams.set("search_terms", query);
+  url.searchParams.set("search_simple", "1");
+  url.searchParams.set("action", "process");
+  url.searchParams.set("json", "1");
+  url.searchParams.set("page_size", "5");
+  url.searchParams.set(
+    "fields",
+    "product_name,brands,quantity,serving_size,nutriments"
+  );
+
+  const response = await fetch(url.toString(), {
+    headers: {
+      Accept: "application/json",
+      "User-Agent": OPEN_FOOD_FACTS_USER_AGENT,
+    },
+  });
+
+  if (!response.ok) return null;
+
+  const data = await response.json();
+  const products = Array.isArray(data.products) ? data.products : [];
+  if (products.length === 0) return null;
+
+  const product = products.find((p) => p?.nutriments) || products[0];
+  const n = product.nutriments || {};
+
+  const caloriesPer100 = Number(n["energy-kcal_100g"] ?? n["energy-kcal"] ?? 0);
+  const proteinPer100 = Number(n["proteins_100g"] ?? 0);
+  const fatPer100 = Number(n["fat_100g"] ?? 0);
+  const carbsPer100 = Number(n["carbohydrates_100g"] ?? 0);
+
+  if (!caloriesPer100 && !proteinPer100 && !fatPer100 && !carbsPer100) return null;
+
+  let grams = gramsFromItem(item, findFoodRecord(item.name));
+
+  if (!grams && String(item.unit || "").match(/יחידה|עוגייה|עוגיה|cookie/i)) {
+    const serving = String(product.serving_size || "");
+    const match = serving.match(/(\d+(?:[.,]\d+)?)\s*g/i);
+    if (match) grams = Number(match[1].replace(",", "."));
+  }
+
+  if (!grams && normalizeText(item.name).includes("oreo")) grams = 11;
+  if (!grams && normalizeText(item.name).includes("אוראו")) grams = 11;
+  if (!grams) grams = normalizeQuantity(item.quantity);
+
+  const multiplier = grams / 100;
+
+  return {
+    name: originalName || product.product_name || "רכיב מזון",
+    quantity: normalizeQuantity(item.quantity),
+    unit: String(item.unit || "מנה"),
+    calories: Math.round(caloriesPer100 * multiplier),
+    protein: Math.round(proteinPer100 * multiplier),
+    fat: Math.round(fatPer100 * multiplier),
+    carbs: Math.round(carbsPer100 * multiplier),
+    notes: `Open Food Facts: ${product.product_name || query}; כ-${Math.round(grams)} גרם`,
+    source: "open_food_facts",
+    confidence: "high",
+  };
+}
+
 async function calcUsdaFoodItem(item) {
   if (!FDC_API_KEY) return null;
 
@@ -417,6 +498,12 @@ async function verifyAndCalculateItems(items) {
     const internal = calcKnownFoodItem(simplified);
     if (internal) {
       verified.push(sanityCheckItem(internal));
+      continue;
+    }
+
+    const openFoodFacts = await calcOpenFoodFactsItem(simplified);
+    if (openFoodFacts) {
+      verified.push(sanityCheckItem(openFoodFacts));
       continue;
     }
 
@@ -568,7 +655,7 @@ app.get("/", (req, res) => {
   res.json({
     status: "ok",
     service: "nutrition-ai-server",
-    version: "chatgpt-image-israel-db-v4",
+    version: "metric-meal-v5-off-usda",
     usda_enabled: Boolean(FDC_API_KEY),
     endpoints: ["/analyze-meal", "/analyze-text-meal"],
   });
@@ -628,7 +715,7 @@ app.post("/analyze-meal", upload.single("image"), async (req, res) => {
       buildMealResultFromItems(
         normalized.meal_name,
         verifiedItems,
-        "תמונה נותחה עם AI; הערכים אומתו מול מאגר פנימי/USDA/AI לפי זמינות."
+        "תמונה נותחה עם AI; הערכים אומתו מול מאגר פנימי/Open Food Facts/USDA/AI לפי זמינות."
       )
     );
   } catch (error) {
@@ -657,7 +744,7 @@ app.post("/analyze-text-meal", async (req, res) => {
       buildMealResultFromItems(
         mealName,
         verifiedItems,
-        "מאכלים מוכרים חושבו לפי מאגר פנימי; השאר אומתו מול USDA או הוערכו עם AI."
+        "מאכלים מוכרים חושבו לפי מאגר פנימי; מוצרים ארוזים מול Open Food Facts; השאר מול USDA או AI."
       )
     );
   } catch (error) {
