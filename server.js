@@ -655,7 +655,7 @@ app.get("/", (req, res) => {
   res.json({
     status: "ok",
     service: "nutrition-ai-server",
-    version: "metric-meal-v5-off-usda",
+    version: "metric-meal-v6-off-usda",
     usda_enabled: Boolean(FDC_API_KEY),
     endpoints: ["/analyze-meal", "/analyze-text-meal"],
   });
