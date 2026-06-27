@@ -133,9 +133,64 @@ async function analyzeTextMealWithChatGpt({ mealName, items }) {
   const result = normalizeMealResult(await parseJsonFromAi(response), mealName);
   analysisCache[cacheKey] = result; saveCache(); return withCacheMeta(result, cacheKey, false);
 }
-app.get("/", (req, res) => res.json({ status: "ok", service: "nutrition-ai-server", version: "metric-meal-v13-free-text-stable-cache", model: process.env.OPENAI_MODEL || "gpt-5.4-mini", cache_enabled: CACHE_ENABLED, cached_analyses: Object.keys(analysisCache).length, rule: "ChatGPT analyzes every image/text meal. Identical input is cached and reused so repeated analysis of the same meal does not change values.", endpoints: ["/analyze-meal", "/analyze-text-meal", "/clear-cache"] }));
+
+function buildMealImagePrompt({ mealName, description, items }) {
+  const itemText = Array.isArray(items)
+    ? items
+        .map((item) => `${item.name || ""} ${item.quantity || ""} ${item.unit || ""}`.trim())
+        .filter(Boolean)
+        .join(", ")
+    : "";
+
+  return `
+Create a realistic, appetizing, high-quality photo of the exact meal described below.
+The image should look like a real smartphone food photo for a nutrition tracking app.
+Show the actual foods described, not a random healthy plate.
+No text, no labels, no logos, no hands, no people.
+Use a clean plate or bowl, natural light, top-down or 45-degree angle.
+Meal name: ${mealName || "meal"}
+Meal description: ${description || ""}
+Meal items: ${itemText || ""}
+`.trim();
+}
+
+app.post("/generate-meal-image", async (req, res) => {
+  try {
+    if (!requireApiKey(res)) return;
+
+    const mealName = String(req.body?.meal_name || "ארוחה");
+    const description = String(req.body?.description || "");
+    const items = Array.isArray(req.body?.items) ? req.body.items : [];
+    const prompt = buildMealImagePrompt({ mealName, description, items });
+
+    const image = await client.images.generate({
+      model: process.env.OPENAI_IMAGE_MODEL || "gpt-image-1",
+      prompt,
+      n: 1,
+      size: "1024x1024",
+      quality: process.env.OPENAI_IMAGE_QUALITY || "low",
+      output_format: "jpeg",
+    });
+
+    const first = image?.data?.[0] || {};
+    return res.json({
+      status: "ok",
+      image_base64: first.b64_json || "",
+      image_url: first.url || "",
+      source: "openai_image_generation",
+    });
+  } catch (error) {
+    console.error("generate-meal-image failed:", error);
+    return res.status(500).json({
+      error: "Failed to generate meal image",
+      details: error.message,
+    });
+  }
+});
+
+app.get("/", (req, res) => res.json({ status: "ok", service: "nutrition-ai-server", version: "metric-meal-v14-ai-meal-images", model: process.env.OPENAI_MODEL || "gpt-5.4-mini", cache_enabled: CACHE_ENABLED, cached_analyses: Object.keys(analysisCache).length, rule: "ChatGPT analyzes every image/text meal. Identical input is cached and reused so repeated analysis of the same meal does not change values.", endpoints: ["/analyze-meal", "/analyze-text-meal", "/generate-meal-image", "/clear-cache"] }));
 app.post("/clear-cache", (req, res) => { analysisCache = {}; saveCache(); res.json({ status: "ok", cleared: true }); });
 app.post("/analyze-meal", upload.single("image"), async (req, res) => { try { if (!requireApiKey(res)) return; if (!req.file) return res.status(400).json({ error: "No image uploaded" }); const result = await analyzeImageWithChatGpt({ base64Image: req.file.buffer.toString("base64"), mimeType: detectImageMimeType(req.file.buffer, req.file.originalname) }); return res.json(result); } catch (error) { console.error("analyze-meal failed:", error); return res.status(500).json({ error: "Failed to analyze meal image with ChatGPT", details: error.message }); } });
 app.post("/analyze-text-meal", async (req, res) => { try { if (!requireApiKey(res)) return; const mealName = String(req.body?.meal_name || "ארוחה ידנית"); const items = Array.isArray(req.body?.items) ? req.body.items : []; if (items.length === 0) return res.status(400).json({ error: "No food items provided" }); const result = await analyzeTextMealWithChatGpt({ mealName, items }); return res.json(result); } catch (error) { console.error("analyze-text-meal failed:", error); return res.status(500).json({ error: "Failed to analyze text meal with ChatGPT", details: error.message }); } });
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`Nutrition AI server v13 is running on port ${port}`));
+app.listen(port, () => console.log(`Nutrition AI server v14 is running on port ${port}`));
