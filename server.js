@@ -16,6 +16,9 @@ app.use(cors());
 app.use(express.json({ limit: "4mb" }));
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const OPEN_FOOD_FACTS_USER_AGENT =
+  process.env.OPEN_FOOD_FACTS_USER_AGENT ||
+  "nutrition-app/1.0 (contact: nutrition-app-user)";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const CACHE_DIR = path.join(__dirname, ".nutrition-cache");
@@ -188,9 +191,190 @@ app.post("/generate-meal-image", async (req, res) => {
   }
 });
 
-app.get("/", (req, res) => res.json({ status: "ok", service: "nutrition-ai-server", version: "metric-meal-v14-ai-meal-images", model: process.env.OPENAI_MODEL || "gpt-5.4-mini", cache_enabled: CACHE_ENABLED, cached_analyses: Object.keys(analysisCache).length, rule: "ChatGPT analyzes every image/text meal. Identical input is cached and reused so repeated analysis of the same meal does not change values.", endpoints: ["/analyze-meal", "/analyze-text-meal", "/generate-meal-image", "/clear-cache"] }));
+
+function numberFrom(value) {
+  const parsed = Number(String(value ?? "").replace(",", ".").replace(/[^\d.-]/g, ""));
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function gramsFromServingSize(value) {
+  const text = String(value || "").toLowerCase().replace(",", ".");
+  const match = text.match(/([\d.]+)\s*(g|גרם|grams?)/);
+  if (match) return Number(match[1]);
+  const mlMatch = text.match(/([\d.]+)\s*(ml|מ"ל|מל)/);
+  if (mlMatch) return Number(mlMatch[1]);
+  return 100;
+}
+
+function nutriment(nutriments, keys) {
+  for (const key of keys) {
+    const value = nutriments?.[key];
+    const parsed = numberFrom(value);
+    if (parsed > 0) return parsed;
+  }
+  return 0;
+}
+
+async function openFoodFactsByBarcode(barcode) {
+  const url = `https://world.openfoodfacts.org/api/v2/product/${encodeURIComponent(barcode)}.json?fields=product_name,brands,quantity,serving_size,nutriments,image_url,image_front_url`;
+  const response = await fetch(url, {
+    headers: {
+      Accept: "application/json",
+      "User-Agent": OPEN_FOOD_FACTS_USER_AGENT,
+    },
+  });
+
+  if (!response.ok) return null;
+
+  const data = await response.json();
+  if (!data || data.status !== 1 || !data.product) return null;
+
+  const product = data.product;
+  const n = product.nutriments || {};
+  const servingGrams = gramsFromServingSize(product.serving_size || product.quantity || "100g");
+  const factor = servingGrams / 100;
+
+  const calories =
+    nutriment(n, ["energy-kcal_serving", "energy-kcal"]) ||
+    Math.round(nutriment(n, ["energy-kcal_100g"]) * factor);
+  const protein =
+    nutriment(n, ["proteins_serving", "proteins"]) ||
+    Math.round(nutriment(n, ["proteins_100g"]) * factor * 10) / 10;
+  const fat =
+    nutriment(n, ["fat_serving", "fat"]) ||
+    Math.round(nutriment(n, ["fat_100g"]) * factor * 10) / 10;
+  const carbs =
+    nutriment(n, ["carbohydrates_serving", "carbohydrates"]) ||
+    Math.round(nutriment(n, ["carbohydrates_100g"]) * factor * 10) / 10;
+
+  const name = [product.product_name, product.brands].filter(Boolean).join(" - ") || `מוצר ברקוד ${barcode}`;
+
+  return {
+    meal_name: name,
+    calories: Math.round(calories),
+    protein: Math.round(protein),
+    fat: Math.round(fat),
+    carbs: Math.round(carbs),
+    confidence: "high",
+    notes: `נמצא לפי ברקוד ב-Open Food Facts. גודל מנה משוער: ${Math.round(servingGrams)} גרם.`,
+    image_url: product.image_front_url || product.image_url || "",
+    items: [
+      {
+        name,
+        quantity: Math.round(servingGrams),
+        unit: "גרם",
+        calories: Math.round(calories),
+        protein: Math.round(protein),
+        fat: Math.round(fat),
+        carbs: Math.round(carbs),
+        confidence: "high",
+        notes: `ברקוד: ${barcode}`,
+      },
+    ],
+  };
+}
+
+async function analyzeBarcodeWithChatGptFallback(barcode) {
+  const response = await createResponse([
+    { role: "system", content: [{ type: "input_text", text: systemPrompt() }] },
+    {
+      role: "user",
+      content: [
+        {
+          type: "input_text",
+          text:
+            `לא נמצא מוצר במאגר לפי הברקוד ${barcode}. ` +
+            "אם אתה לא יכול לזהות מוצר לפי הברקוד בלבד, החזר JSON עם confidence low ושם מוצר כללי. " +
+            "אל תמציא מותג ספציפי אם אין מידע.",
+        },
+      ],
+    },
+  ]);
+
+  return normalizeMealResult(await parseJsonFromAi(response), `מוצר ברקוד ${barcode}`);
+}
+
+async function analyzeNutritionLabelWithChatGpt({ base64Image, mimeType }) {
+  const response = await createResponse([
+    {
+      role: "system",
+      content: [
+        {
+          type: "input_text",
+          text:
+            systemPrompt() +
+            "\\n\\nאתה מנתח צילום של תווית תזונתית מאריזת מזון. " +
+            "קרא את הטבלה מהתמונה. החזר ערכים לפי מנה אחת אם מופיעה מנה; אחרת לפי 100 גרם. " +
+            "הקפד לחלץ קלוריות, חלבון, שומן ופחמימות. אם יש שם מוצר בתמונה, השתמש בו בשם הארוחה. החזר JSON בלבד.",
+        },
+      ],
+    },
+    {
+      role: "user",
+      content: [
+        {
+          type: "input_text",
+          text:
+            "נתח את התווית התזונתית המצולמת. צור פריט מזון אחד או יותר לפי הנתונים שעל האריזה. " +
+            "אם מופיעים ערכים ל-100 גרם בלבד, השתמש בכמות 100 גרם. אם מופיעה מנה, השתמש במנה.",
+        },
+        { type: "input_image", image_url: `data:${mimeType};base64,${base64Image}` },
+      ],
+    },
+  ]);
+
+  return normalizeMealResult(await parseJsonFromAi(response), "מוצר מתווית תזונתית");
+}
+
+app.post("/analyze-barcode", async (req, res) => {
+  try {
+    const barcode = String(req.body?.barcode || "").trim();
+
+    if (!barcode) {
+      return res.status(400).json({ error: "Barcode is missing" });
+    }
+
+    const offResult = await openFoodFactsByBarcode(barcode);
+    if (offResult) return res.json(offResult);
+
+    if (!requireApiKey(res)) return;
+    const fallback = await analyzeBarcodeWithChatGptFallback(barcode);
+    return res.json(fallback);
+  } catch (error) {
+    console.error("analyze-barcode failed:", error);
+    return res.status(500).json({
+      error: "Failed to analyze barcode",
+      details: error.message,
+    });
+  }
+});
+
+app.post("/analyze-nutrition-label", upload.single("image"), async (req, res) => {
+  try {
+    if (!requireApiKey(res)) return;
+
+    if (!req.file) {
+      return res.status(400).json({ error: "No image uploaded" });
+    }
+
+    const result = await analyzeNutritionLabelWithChatGpt({
+      base64Image: req.file.buffer.toString("base64"),
+      mimeType: detectImageMimeType(req.file.buffer, req.file.originalname),
+    });
+
+    return res.json(result);
+  } catch (error) {
+    console.error("analyze-nutrition-label failed:", error);
+    return res.status(500).json({
+      error: "Failed to analyze nutrition label",
+      details: error.message,
+    });
+  }
+});
+
+app.get("/", (req, res) => res.json({ status: "ok", service: "nutrition-ai-server", version: "metric-meal-v15-barcode-label-scanning", model: process.env.OPENAI_MODEL || "gpt-5.4-mini", cache_enabled: CACHE_ENABLED, cached_analyses: Object.keys(analysisCache).length, rule: "ChatGPT analyzes every image/text meal. Identical input is cached and reused so repeated analysis of the same meal does not change values.", endpoints: ["/analyze-meal", "/analyze-text-meal", "/analyze-barcode", "/analyze-nutrition-label", "/generate-meal-image", "/clear-cache"] }));
 app.post("/clear-cache", (req, res) => { analysisCache = {}; saveCache(); res.json({ status: "ok", cleared: true }); });
 app.post("/analyze-meal", upload.single("image"), async (req, res) => { try { if (!requireApiKey(res)) return; if (!req.file) return res.status(400).json({ error: "No image uploaded" }); const result = await analyzeImageWithChatGpt({ base64Image: req.file.buffer.toString("base64"), mimeType: detectImageMimeType(req.file.buffer, req.file.originalname) }); return res.json(result); } catch (error) { console.error("analyze-meal failed:", error); return res.status(500).json({ error: "Failed to analyze meal image with ChatGPT", details: error.message }); } });
 app.post("/analyze-text-meal", async (req, res) => { try { if (!requireApiKey(res)) return; const mealName = String(req.body?.meal_name || "ארוחה ידנית"); const items = Array.isArray(req.body?.items) ? req.body.items : []; if (items.length === 0) return res.status(400).json({ error: "No food items provided" }); const result = await analyzeTextMealWithChatGpt({ mealName, items }); return res.json(result); } catch (error) { console.error("analyze-text-meal failed:", error); return res.status(500).json({ error: "Failed to analyze text meal with ChatGPT", details: error.message }); } });
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`Nutrition AI server v14 is running on port ${port}`));
+app.listen(port, () => console.log(`Nutrition AI server v15 is running on port ${port}`));
