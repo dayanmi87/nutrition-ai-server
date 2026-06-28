@@ -192,83 +192,158 @@ app.post("/generate-meal-image", async (req, res) => {
 });
 
 
+
 function numberFrom(value) {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
   const parsed = Number(String(value ?? "").replace(",", ".").replace(/[^\d.-]/g, ""));
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
-function gramsFromServingSize(value) {
+function parseQuantityGrams(value) {
   const text = String(value || "").toLowerCase().replace(",", ".");
-  const match = text.match(/([\d.]+)\s*(g|גרם|grams?)/);
-  if (match) return Number(match[1]);
-  const mlMatch = text.match(/([\d.]+)\s*(ml|מ"ל|מל)/);
+  const gramMatch = text.match(/([\d.]+)\s*(g|גרם|grams?)/);
+  if (gramMatch) return Number(gramMatch[1]);
+  const kgMatch = text.match(/([\d.]+)\s*(kg|ק\"ג|קג|kilograms?)/);
+  if (kgMatch) return Number(kgMatch[1]) * 1000;
+  const mlMatch = text.match(/([\d.]+)\s*(ml|מ\"ל|מל)/);
   if (mlMatch) return Number(mlMatch[1]);
-  return 100;
+  const lMatch = text.match(/([\d.]+)\s*(l|liter|litre|ליטר)/);
+  if (lMatch) return Number(lMatch[1]) * 1000;
+  return 0;
 }
 
-function nutriment(nutriments, keys) {
+function firstPositive(obj, keys) {
   for (const key of keys) {
-    const value = nutriments?.[key];
-    const parsed = numberFrom(value);
-    if (parsed > 0) return parsed;
+    const value = numberFrom(obj?.[key]);
+    if (value > 0) return value;
   }
   return 0;
 }
 
-async function openFoodFactsByBarcode(barcode) {
-  const url = `https://world.openfoodfacts.org/api/v2/product/${encodeURIComponent(barcode)}.json?fields=product_name,brands,quantity,serving_size,nutriments,image_url,image_front_url`;
-  const response = await fetch(url, {
-    headers: {
-      Accept: "application/json",
-      "User-Agent": OPEN_FOOD_FACTS_USER_AGENT,
-    },
-  });
+function kcalFromEnergy(value) {
+  const n = numberFrom(value);
+  if (n <= 0) return 0;
+  return n > 1000 ? n / 4.184 : n;
+}
 
+function kcalPer100(nutriments) {
+  return firstPositive(nutriments, ["energy-kcal_100g", "energy-kcal"]) || kcalFromEnergy(nutriments?.["energy_100g"]) || kcalFromEnergy(nutriments?.energy);
+}
+
+function macroPer100(nutriments, macro) {
+  return firstPositive(nutriments, [`${macro}_100g`, macro]);
+}
+
+function kcalServing(nutriments) {
+  return firstPositive(nutriments, ["energy-kcal_serving"]) || kcalFromEnergy(nutriments?.["energy_serving"]);
+}
+
+function macroServing(nutriments, macro) {
+  return firstPositive(nutriments, [`${macro}_serving`]);
+}
+
+function roundMacro(value) {
+  return Math.round(numberFrom(value) * 10) / 10;
+}
+
+function roundKcal(value) {
+  return Math.round(numberFrom(value));
+}
+
+function barcodeServingGrams(product) {
+  const servingQuantity = numberFrom(product.serving_quantity);
+  if (servingQuantity > 0) return servingQuantity;
+  const servingSize = parseQuantityGrams(product.serving_size);
+  if (servingSize > 0) return servingSize;
+  const packageQuantity = parseQuantityGrams(product.quantity);
+  if (packageQuantity > 0 && packageQuantity <= 250) return packageQuantity;
+  return 100;
+}
+
+function barcodeNutritionFromProduct(product) {
+  const n = product.nutriments || {};
+  const servingGrams = barcodeServingGrams(product);
+  const factor = servingGrams / 100;
+
+  const per100 = {
+    calories: kcalPer100(n),
+    protein: macroPer100(n, "proteins"),
+    fat: macroPer100(n, "fat"),
+    carbs: macroPer100(n, "carbohydrates"),
+  };
+
+  const perServing = {
+    calories: kcalServing(n),
+    protein: macroServing(n, "proteins"),
+    fat: macroServing(n, "fat"),
+    carbs: macroServing(n, "carbohydrates"),
+  };
+
+  const hasFullServing = perServing.calories > 0 && perServing.protein > 0 && perServing.fat > 0 && perServing.carbs > 0;
+
+  const values = hasFullServing
+    ? perServing
+    : {
+        calories: per100.calories * factor,
+        protein: per100.protein * factor,
+        fat: per100.fat * factor,
+        carbs: per100.carbs * factor,
+      };
+
+  return {
+    servingGrams,
+    per100,
+    values: {
+      calories: roundKcal(values.calories),
+      protein: roundMacro(values.protein),
+      fat: roundMacro(values.fat),
+      carbs: roundMacro(values.carbs),
+    },
+    calculationSource: hasFullServing ? "serving" : "per_100g_scaled",
+  };
+}
+
+async function openFoodFactsByBarcode(barcode) {
+  const url = `https://world.openfoodfacts.org/api/v2/product/${encodeURIComponent(barcode)}.json?fields=product_name,product_name_he,brands,quantity,serving_size,serving_quantity,nutriments,image_url,image_front_url,selected_images`;
+  const response = await fetch(url, { headers: { Accept: "application/json", "User-Agent": OPEN_FOOD_FACTS_USER_AGENT } });
   if (!response.ok) return null;
 
   const data = await response.json();
   if (!data || data.status !== 1 || !data.product) return null;
 
   const product = data.product;
-  const n = product.nutriments || {};
-  const servingGrams = gramsFromServingSize(product.serving_size || product.quantity || "100g");
-  const factor = servingGrams / 100;
+  const nutrition = barcodeNutritionFromProduct(product);
+  const hasUsefulValues = nutrition.values.calories > 0 && (nutrition.values.protein > 0 || nutrition.values.fat > 0 || nutrition.values.carbs > 0);
+  if (!hasUsefulValues) return null;
 
-  const calories =
-    nutriment(n, ["energy-kcal_serving", "energy-kcal"]) ||
-    Math.round(nutriment(n, ["energy-kcal_100g"]) * factor);
-  const protein =
-    nutriment(n, ["proteins_serving", "proteins"]) ||
-    Math.round(nutriment(n, ["proteins_100g"]) * factor * 10) / 10;
-  const fat =
-    nutriment(n, ["fat_serving", "fat"]) ||
-    Math.round(nutriment(n, ["fat_100g"]) * factor * 10) / 10;
-  const carbs =
-    nutriment(n, ["carbohydrates_serving", "carbohydrates"]) ||
-    Math.round(nutriment(n, ["carbohydrates_100g"]) * factor * 10) / 10;
+  const nameParts = [product.product_name_he, product.product_name, product.brands].filter(Boolean);
+  const name = nameParts.length > 0 ? nameParts.join(" - ") : `מוצר ברקוד ${barcode}`;
+  const imageUrl = product.image_front_url || product.image_url || product.selected_images?.front?.display?.he || product.selected_images?.front?.display?.en || "";
 
-  const name = [product.product_name, product.brands].filter(Boolean).join(" - ") || `מוצר ברקוד ${barcode}`;
+  const sourceText = nutrition.calculationSource === "serving"
+    ? "ערכי serving מתוך Open Food Facts"
+    : `ערכי 100 גרם × ${Math.round(nutrition.servingGrams)} גרם מתוך Open Food Facts`;
 
   return {
     meal_name: name,
-    calories: Math.round(calories),
-    protein: Math.round(protein),
-    fat: Math.round(fat),
-    carbs: Math.round(carbs),
+    calories: nutrition.values.calories,
+    protein: nutrition.values.protein,
+    fat: nutrition.values.fat,
+    carbs: nutrition.values.carbs,
     confidence: "high",
-    notes: `נמצא לפי ברקוד ב-Open Food Facts. גודל מנה משוער: ${Math.round(servingGrams)} גרם.`,
-    image_url: product.image_front_url || product.image_url || "",
+    notes: `${sourceText}. ל-100 גרם: ${roundKcal(nutrition.per100.calories)} קל׳, ${roundMacro(nutrition.per100.protein)} חלבון, ${roundMacro(nutrition.per100.fat)} שומן, ${roundMacro(nutrition.per100.carbs)} פחמימות. ברקוד: ${barcode}.`,
+    image_url: imageUrl,
     items: [
       {
         name,
-        quantity: Math.round(servingGrams),
+        quantity: Math.round(nutrition.servingGrams),
         unit: "גרם",
-        calories: Math.round(calories),
-        protein: Math.round(protein),
-        fat: Math.round(fat),
-        carbs: Math.round(carbs),
+        calories: nutrition.values.calories,
+        protein: nutrition.values.protein,
+        fat: nutrition.values.fat,
+        carbs: nutrition.values.carbs,
         confidence: "high",
-        notes: `ברקוד: ${barcode}`,
+        notes: sourceText,
       },
     ],
   };
@@ -277,21 +352,10 @@ async function openFoodFactsByBarcode(barcode) {
 async function analyzeBarcodeWithChatGptFallback(barcode) {
   const response = await createResponse([
     { role: "system", content: [{ type: "input_text", text: systemPrompt() }] },
-    {
-      role: "user",
-      content: [
-        {
-          type: "input_text",
-          text:
-            `לא נמצא מוצר במאגר לפי הברקוד ${barcode}. ` +
-            "אם אתה לא יכול לזהות מוצר לפי הברקוד בלבד, החזר JSON עם confidence low ושם מוצר כללי. " +
-            "אל תמציא מותג ספציפי אם אין מידע.",
-        },
-      ],
-    },
+    { role: "user", content: [{ type: "input_text", text: `לא נמצא מוצר עם ערכים תקינים ב-Open Food Facts לפי הברקוד ${barcode}. אל תנחש מותג ספציפי. אם אינך יודע לזהות את המוצר מהברקוד בלבד, החזר פריט כללי עם confidence low והערה שהברקוד לא נמצא במאגר.` }] },
   ]);
-
-  return normalizeMealResult(await parseJsonFromAi(response), `מוצר ברקוד ${barcode}`);
+  const result = normalizeMealResult(await parseJsonFromAi(response), `מוצר ברקוד ${barcode}`);
+  return { ...result, notes: `${result.notes || ""} | הברקוד לא נמצא במאגר מוצרים עם ערכים תקינים.` };
 }
 
 async function analyzeNutritionLabelWithChatGpt({ base64Image, mimeType }) {
@@ -303,9 +367,7 @@ async function analyzeNutritionLabelWithChatGpt({ base64Image, mimeType }) {
           type: "input_text",
           text:
             systemPrompt() +
-            "\\n\\nאתה מנתח צילום של תווית תזונתית מאריזת מזון. " +
-            "קרא את הטבלה מהתמונה. החזר ערכים לפי מנה אחת אם מופיעה מנה; אחרת לפי 100 גרם. " +
-            "הקפד לחלץ קלוריות, חלבון, שומן ופחמימות. אם יש שם מוצר בתמונה, השתמש בו בשם הארוחה. החזר JSON בלבד.",
+            "\n\nאתה מנתח צילום של תווית תזונתית מאריזת מזון. המשימה היא OCR מדויק לטבלת הערכים, לא הערכה כללית. העתק את המספרים מהתווית כפי שמופיעים. אם קיימת עמודת 'למנה' או 'per serving' — השתמש בה כברירת מחדל. אם קיימת רק עמודת 'ל-100 גרם' — החזר פריט בכמות 100 גרם. אם קיימים גם 100 גרם וגם מנה — כתוב בהערות את ערכי 100 גרם ואת גודל המנה. אין לנחש ערכים אם המספרים לא קריאים; במקרה כזה confidence low והערה מפורשת. החזר JSON בלבד.",
         },
       ],
     },
@@ -315,66 +377,45 @@ async function analyzeNutritionLabelWithChatGpt({ base64Image, mimeType }) {
         {
           type: "input_text",
           text:
-            "נתח את התווית התזונתית המצולמת. צור פריט מזון אחד או יותר לפי הנתונים שעל האריזה. " +
-            "אם מופיעים ערכים ל-100 גרם בלבד, השתמש בכמות 100 גרם. אם מופיעה מנה, השתמש במנה.",
+            "קרא את טבלת הערכים התזונתיים מהתמונה. צור מוצר אחד בלבד עם הערכים המדויקים מהתווית: קלוריות, חלבון, שומן ופחמימות. השתמש בשם המוצר אם מופיע בתמונה; אחרת קרא לו 'מוצר מתווית תזונתית'.",
         },
         { type: "input_image", image_url: `data:${mimeType};base64,${base64Image}` },
       ],
     },
   ]);
-
   return normalizeMealResult(await parseJsonFromAi(response), "מוצר מתווית תזונתית");
 }
 
 app.post("/analyze-barcode", async (req, res) => {
   try {
     const barcode = String(req.body?.barcode || "").trim();
-
-    if (!barcode) {
-      return res.status(400).json({ error: "Barcode is missing" });
-    }
-
+    if (!barcode) return res.status(400).json({ error: "Barcode is missing" });
     const offResult = await openFoodFactsByBarcode(barcode);
     if (offResult) return res.json(offResult);
-
     if (!requireApiKey(res)) return;
     const fallback = await analyzeBarcodeWithChatGptFallback(barcode);
     return res.json(fallback);
   } catch (error) {
     console.error("analyze-barcode failed:", error);
-    return res.status(500).json({
-      error: "Failed to analyze barcode",
-      details: error.message,
-    });
+    return res.status(500).json({ error: "Failed to analyze barcode", details: error.message });
   }
 });
 
 app.post("/analyze-nutrition-label", upload.single("image"), async (req, res) => {
   try {
     if (!requireApiKey(res)) return;
-
-    if (!req.file) {
-      return res.status(400).json({ error: "No image uploaded" });
-    }
-
-    const result = await analyzeNutritionLabelWithChatGpt({
-      base64Image: req.file.buffer.toString("base64"),
-      mimeType: detectImageMimeType(req.file.buffer, req.file.originalname),
-    });
-
+    if (!req.file) return res.status(400).json({ error: "No image uploaded" });
+    const result = await analyzeNutritionLabelWithChatGpt({ base64Image: req.file.buffer.toString("base64"), mimeType: detectImageMimeType(req.file.buffer, req.file.originalname) });
     return res.json(result);
   } catch (error) {
     console.error("analyze-nutrition-label failed:", error);
-    return res.status(500).json({
-      error: "Failed to analyze nutrition label",
-      details: error.message,
-    });
+    return res.status(500).json({ error: "Failed to analyze nutrition label", details: error.message });
   }
 });
 
-app.get("/", (req, res) => res.json({ status: "ok", service: "nutrition-ai-server", version: "metric-meal-v15-barcode-label-scanning", model: process.env.OPENAI_MODEL || "gpt-5.4-mini", cache_enabled: CACHE_ENABLED, cached_analyses: Object.keys(analysisCache).length, rule: "ChatGPT analyzes every image/text meal. Identical input is cached and reused so repeated analysis of the same meal does not change values.", endpoints: ["/analyze-meal", "/analyze-text-meal", "/analyze-barcode", "/analyze-nutrition-label", "/generate-meal-image", "/clear-cache"] }));
+app.get("/", (req, res) => res.json({ status: "ok", service: "nutrition-ai-server", version: "metric-meal-v16-barcode-label-accuracy-image-fix", model: process.env.OPENAI_MODEL || "gpt-5.4-mini", cache_enabled: CACHE_ENABLED, cached_analyses: Object.keys(analysisCache).length, rule: "ChatGPT analyzes every image/text meal. Identical input is cached and reused so repeated analysis of the same meal does not change values.", endpoints: ["/analyze-meal", "/analyze-text-meal", "/analyze-barcode", "/analyze-nutrition-label", "/generate-meal-image", "/clear-cache"] }));
 app.post("/clear-cache", (req, res) => { analysisCache = {}; saveCache(); res.json({ status: "ok", cleared: true }); });
 app.post("/analyze-meal", upload.single("image"), async (req, res) => { try { if (!requireApiKey(res)) return; if (!req.file) return res.status(400).json({ error: "No image uploaded" }); const result = await analyzeImageWithChatGpt({ base64Image: req.file.buffer.toString("base64"), mimeType: detectImageMimeType(req.file.buffer, req.file.originalname) }); return res.json(result); } catch (error) { console.error("analyze-meal failed:", error); return res.status(500).json({ error: "Failed to analyze meal image with ChatGPT", details: error.message }); } });
 app.post("/analyze-text-meal", async (req, res) => { try { if (!requireApiKey(res)) return; const mealName = String(req.body?.meal_name || "ארוחה ידנית"); const items = Array.isArray(req.body?.items) ? req.body.items : []; if (items.length === 0) return res.status(400).json({ error: "No food items provided" }); const result = await analyzeTextMealWithChatGpt({ mealName, items }); return res.json(result); } catch (error) { console.error("analyze-text-meal failed:", error); return res.status(500).json({ error: "Failed to analyze text meal with ChatGPT", details: error.message }); } });
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`Nutrition AI server v15 is running on port ${port}`));
+app.listen(port, () => console.log(`Nutrition AI server v16 is running on port ${port}`));
