@@ -92,7 +92,22 @@ function normalizeItem(item) {
 function normalizeMealResult(parsed, fallbackName = "ארוחה") {
   const items = Array.isArray(parsed?.items) ? parsed.items.map(normalizeItem) : [];
   const totals = items.reduce((s, i) => ({ calories: s.calories + i.calories, protein: s.protein + i.protein, fat: s.fat + i.fat, carbs: s.carbs + i.carbs }), { calories: 0, protein: 0, fat: 0, carbs: 0 });
-  return { meal_name: String(parsed?.meal_name || fallbackName).trim(), calories: Math.round(totals.calories), protein: round1(totals.protein), fat: round1(totals.fat), carbs: round1(totals.carbs), confidence: ["low","medium","high"].includes(String(parsed?.confidence)) ? parsed.confidence : "medium", notes: String(parsed?.notes || "הערכים חושבו ישירות על ידי ChatGPT לפי הרכיבים והכמויות שזוהו.").trim(), source: "chatgpt_direct_analysis_cached_stable", items };
+  return {
+    meal_name: String(parsed?.meal_name || fallbackName).trim(),
+    calories: Math.round(totals.calories),
+    protein: round1(totals.protein),
+    fat: round1(totals.fat),
+    carbs: round1(totals.carbs),
+    confidence: ["low","medium","high"].includes(String(parsed?.confidence)) ? parsed.confidence : "medium",
+    notes: String(parsed?.notes || "הערכים חושבו ישירות על ידי ChatGPT לפי הרכיבים והכמויות שזוהו.").trim(),
+    source: "chatgpt_direct_analysis_cached_stable",
+    items,
+    package_grams: round1(parsed?.package_grams || 0),
+    serving_grams: round1(parsed?.serving_grams || 0),
+    servings_per_package: round1(parsed?.servings_per_package || 0),
+    values_basis: String(parsed?.values_basis || "").trim(),
+    needs_package_size: parsed?.needs_package_size === true,
+  };
 }
 function withCacheMeta(result, cacheKey, cacheHit) {
   return { ...result, cache_key: cacheKey, cache_hit: cacheHit, notes: `${result.notes || ""}${cacheHit ? " | תוצאה זהה נשלפה מהמטמון כדי למנוע שינוי בין ניתוחים חוזרים." : " | תוצאה חדשה נשמרה במטמון כדי שבניתוח חוזר לאותם נתונים הערכים יישארו קבועים."}`.trim() };
@@ -146,14 +161,21 @@ function buildMealImagePrompt({ mealName, description, items }) {
     : "";
 
   return `
-Create a realistic, appetizing, high-quality photo of the exact meal described below.
-The image should look like a real smartphone food photo for a nutrition tracking app.
-Show the actual foods described, not a random healthy plate.
-No text, no labels, no logos, no hands, no people.
-Use a clean plate or bowl, natural light, top-down or 45-degree angle.
+Create a realistic, appetizing, high-quality smartphone food photo of the EXACT meal described below.
+
+Critical requirements:
+- The image must match the actual user-provided meal, not a generic healthy salad or random plate.
+- Include the specific foods named in Hebrew/English in the description and items.
+- Respect the approximate quantities and presentation implied by the items.
+- If the meal is simple or homemade, make it look like a real homemade plate.
+- If the user mentioned Israeli/Middle Eastern foods, reflect that food style accurately.
+- Do not add foods that were not mentioned.
+- No text, no labels, no logos, no hands, no people.
+- Use natural light, clean background, top-down or 45-degree angle.
+
 Meal name: ${mealName || "meal"}
-Meal description: ${description || ""}
-Meal items: ${itemText || ""}
+Original user description: ${description || ""}
+Analyzed meal items: ${itemText || ""}
 `.trim();
 }
 
@@ -358,6 +380,86 @@ async function analyzeBarcodeWithChatGptFallback(barcode) {
   return { ...result, notes: `${result.notes || ""} | הברקוד לא נמצא במאגר מוצרים עם ערכים תקינים.` };
 }
 
+
+function scaleNutritionResultItems(result, factor, quantity, unit, note) {
+  const items = Array.isArray(result.items) ? result.items : [];
+  const scaledItems = items.map((item) => ({
+    ...item,
+    quantity,
+    unit,
+    calories: roundKcal(numberFrom(item.calories) * factor),
+    protein: roundMacro(numberFrom(item.protein) * factor),
+    fat: roundMacro(numberFrom(item.fat) * factor),
+    carbs: roundMacro(numberFrom(item.carbs) * factor),
+    notes: `${item.notes || ""} ${note || ""}`.trim(),
+  }));
+
+  const totals = scaledItems.reduce(
+    (sum, item) => ({
+      calories: sum.calories + numberFrom(item.calories),
+      protein: sum.protein + numberFrom(item.protein),
+      fat: sum.fat + numberFrom(item.fat),
+      carbs: sum.carbs + numberFrom(item.carbs),
+    }),
+    { calories: 0, protein: 0, fat: 0, carbs: 0 }
+  );
+
+  return {
+    ...result,
+    items: scaledItems,
+    calories: roundKcal(totals.calories),
+    protein: roundMacro(totals.protein),
+    fat: roundMacro(totals.fat),
+    carbs: roundMacro(totals.carbs),
+  };
+}
+
+function postProcessNutritionLabelResult(result) {
+  const basis = String(result.values_basis || "").toLowerCase();
+  const packageGrams = numberFrom(result.package_grams);
+  const servingGrams = numberFrom(result.serving_grams);
+  const servingsPerPackage = numberFrom(result.servings_per_package);
+
+  if (packageGrams > 0 && basis === "per_100g") {
+    const factor = packageGrams / 100;
+    return {
+      ...scaleNutritionResultItems(result, factor, packageGrams, "גרם", `חושב לכל האריזה לפי ${packageGrams} גרם.`),
+      needs_package_size: false,
+      notes: `${result.notes || ""} הערכים חושבו לכל האריזה לפי גודל אריזה שזוהה בתווית: ${packageGrams} גרם.`.trim(),
+    };
+  }
+
+  if (packageGrams > 0 && basis === "per_serving" && servingsPerPackage > 0) {
+    return {
+      ...scaleNutritionResultItems(result, servingsPerPackage, packageGrams, "גרם", `חושב לכל האריזה לפי ${servingsPerPackage} מנות.`),
+      needs_package_size: false,
+      notes: `${result.notes || ""} הערכים חושבו לכל האריזה לפי ${servingsPerPackage} מנות באריזה.`.trim(),
+    };
+  }
+
+  if (packageGrams > 0 && basis === "per_package") {
+    return { ...result, needs_package_size: false };
+  }
+
+  if (basis === "per_100g" && packageGrams <= 0) {
+    return {
+      ...result,
+      needs_package_size: true,
+      notes: `${result.notes || ""} זוהו ערכים ל־100 גרם בלבד, אך לא זוהה גודל אריזה. נדרש קלט משתמש לגודל האריזה.`.trim(),
+    };
+  }
+
+  if (basis === "per_serving" && packageGrams <= 0 && servingsPerPackage <= 0) {
+    return {
+      ...result,
+      needs_package_size: false,
+      notes: `${result.notes || ""} זוהו ערכים למנה אך לא זוהה גודל אריזה מלא. נשמר לפי מנה אחת.`.trim(),
+    };
+  }
+
+  return result;
+}
+
 async function analyzeNutritionLabelWithChatGpt({ base64Image, mimeType }) {
   const response = await createResponse([
     {
@@ -367,7 +469,20 @@ async function analyzeNutritionLabelWithChatGpt({ base64Image, mimeType }) {
           type: "input_text",
           text:
             systemPrompt() +
-            "\n\nאתה מנתח צילום של תווית תזונתית מאריזת מזון. המשימה היא OCR מדויק לטבלת הערכים, לא הערכה כללית. העתק את המספרים מהתווית כפי שמופיעים. אם קיימת עמודת 'למנה' או 'per serving' — השתמש בה כברירת מחדל. אם קיימת רק עמודת 'ל-100 גרם' — החזר פריט בכמות 100 גרם. אם קיימים גם 100 גרם וגם מנה — כתוב בהערות את ערכי 100 גרם ואת גודל המנה. אין לנחש ערכים אם המספרים לא קריאים; במקרה כזה confidence low והערה מפורשת. החזר JSON בלבד.",
+            "\n\nאתה מנתח צילום של תווית תזונתית מאריזת מזון. המשימה היא OCR מדויק לטבלת הערכים, לא הערכה כללית." +
+            "\nחובה להחזיר JSON בלבד, עם אותם שדות רגילים ובנוסף שדות אלה:" +
+            "\nvalues_basis: אחד מתוך per_100g | per_serving | per_package | unknown" +
+            "\npackage_grams: משקל/נפח כל האריזה בגרמים/מ״ל אם מופיע בתמונה, אחרת 0" +
+            "\nserving_grams: גודל מנה בגרמים/מ״ל אם מופיע, אחרת 0" +
+            "\nservings_per_package: מספר מנות באריזה אם מופיע, אחרת 0" +
+            "\nneeds_package_size: true רק אם קיימים ערכים ל־100 גרם ואין בתמונה גודל אריזה." +
+            "\nכללים:" +
+            "\n1. אם בתמונה מופיעים ערכים ל־100 גרם וגם גודל אריזה — החזר את הערכים ל־100 גרם, values_basis=per_100g, package_grams=גודל האריזה. השרת יחשב לכל האריזה." +
+            "\n2. אם בתמונה מופיעים ערכים לכל האריזה — values_basis=per_package." +
+            "\n3. אם בתמונה מופיעים ערכים למנה — values_basis=per_serving. אם מופיע מספר מנות באריזה, ציין servings_per_package." +
+            "\n4. אם אין גודל אריזה ומופיעים רק ערכים ל־100 גרם — values_basis=per_100g, package_grams=0, needs_package_size=true." +
+            "\n5. אל תנחש גודל אריזה. אם לא קריא — 0." +
+            "\n6. העתק את המספרים מהתווית כפי שמופיעים. אין לנחש ערכים אם המספרים לא קריאים.",
         },
       ],
     },
@@ -377,13 +492,18 @@ async function analyzeNutritionLabelWithChatGpt({ base64Image, mimeType }) {
         {
           type: "input_text",
           text:
-            "קרא את טבלת הערכים התזונתיים מהתמונה. צור מוצר אחד בלבד עם הערכים המדויקים מהתווית: קלוריות, חלבון, שומן ופחמימות. השתמש בשם המוצר אם מופיע בתמונה; אחרת קרא לו 'מוצר מתווית תזונתית'.",
+            "קרא את טבלת הערכים התזונתיים מהתמונה. צור מוצר אחד בלבד עם הערכים המדויקים מהתווית: קלוריות, חלבון, שומן ופחמימות. " +
+            "השתמש בשם המוצר אם מופיע בתמונה; אחרת קרא לו 'מוצר מתווית תזונתית'. " +
+            "אם מופיע גודל אריזה, ציין package_grams. אם לא מופיע ויש רק ערכים ל־100 גרם, סמן needs_package_size=true.",
         },
         { type: "input_image", image_url: `data:${mimeType};base64,${base64Image}` },
       ],
     },
   ]);
-  return normalizeMealResult(await parseJsonFromAi(response), "מוצר מתווית תזונתית");
+
+  const parsed = await parseJsonFromAi(response);
+  const normalized = normalizeMealResult(parsed, "מוצר מתווית תזונתית");
+  return postProcessNutritionLabelResult(normalized);
 }
 
 app.post("/analyze-barcode", async (req, res) => {
@@ -413,9 +533,9 @@ app.post("/analyze-nutrition-label", upload.single("image"), async (req, res) =>
   }
 });
 
-app.get("/", (req, res) => res.json({ status: "ok", service: "nutrition-ai-server", version: "metric-meal-v16-barcode-label-accuracy-image-fix", model: process.env.OPENAI_MODEL || "gpt-5.4-mini", cache_enabled: CACHE_ENABLED, cached_analyses: Object.keys(analysisCache).length, rule: "ChatGPT analyzes every image/text meal. Identical input is cached and reused so repeated analysis of the same meal does not change values.", endpoints: ["/analyze-meal", "/analyze-text-meal", "/analyze-barcode", "/analyze-nutrition-label", "/generate-meal-image", "/clear-cache"] }));
+app.get("/", (req, res) => res.json({ status: "ok", service: "nutrition-ai-server", version: "metric-meal-v19-saved-meals-sleep-leftovers", model: process.env.OPENAI_MODEL || "gpt-5.4-mini", cache_enabled: CACHE_ENABLED, cached_analyses: Object.keys(analysisCache).length, rule: "ChatGPT analyzes every image/text meal. Identical input is cached and reused so repeated analysis of the same meal does not change values.", endpoints: ["/analyze-meal", "/analyze-text-meal", "/analyze-barcode", "/analyze-nutrition-label", "/generate-meal-image", "/clear-cache"] }));
 app.post("/clear-cache", (req, res) => { analysisCache = {}; saveCache(); res.json({ status: "ok", cleared: true }); });
 app.post("/analyze-meal", upload.single("image"), async (req, res) => { try { if (!requireApiKey(res)) return; if (!req.file) return res.status(400).json({ error: "No image uploaded" }); const result = await analyzeImageWithChatGpt({ base64Image: req.file.buffer.toString("base64"), mimeType: detectImageMimeType(req.file.buffer, req.file.originalname) }); return res.json(result); } catch (error) { console.error("analyze-meal failed:", error); return res.status(500).json({ error: "Failed to analyze meal image with ChatGPT", details: error.message }); } });
 app.post("/analyze-text-meal", async (req, res) => { try { if (!requireApiKey(res)) return; const mealName = String(req.body?.meal_name || "ארוחה ידנית"); const items = Array.isArray(req.body?.items) ? req.body.items : []; if (items.length === 0) return res.status(400).json({ error: "No food items provided" }); const result = await analyzeTextMealWithChatGpt({ mealName, items }); return res.json(result); } catch (error) { console.error("analyze-text-meal failed:", error); return res.status(500).json({ error: "Failed to analyze text meal with ChatGPT", details: error.message }); } });
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`Nutrition AI server v16 is running on port ${port}`));
+app.listen(port, () => console.log(`Nutrition AI server v19 is running on port ${port}`));
