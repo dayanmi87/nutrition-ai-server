@@ -506,10 +506,42 @@ async function analyzeNutritionLabelWithChatGpt({ base64Image, mimeType }) {
   return postProcessNutritionLabelResult(normalized);
 }
 
+
+function normalizeScannedProductCode(rawValue) {
+  const raw = String(rawValue || "").trim();
+  if (!raw) return "";
+
+  let decoded = raw;
+  try {
+    decoded = decodeURIComponent(raw);
+  } catch (_) {}
+
+  if (/^\d{8,14}$/.test(decoded)) return decoded;
+
+  try {
+    const url = new URL(decoded);
+    const keys = ["gtin", "barcode", "ean", "code", "product", "productId", "id"];
+    for (const key of keys) {
+      const value = String(url.searchParams.get(key) || "").trim();
+      const match = value.match(/\d{8,14}/);
+      if (match) return match[0];
+    }
+  } catch (_) {}
+
+  const matches = decoded.match(/\d{8,14}/g) || [];
+  if (matches.length) {
+    matches.sort((a, b) => b.length - a.length);
+    return matches[0];
+  }
+
+  return decoded;
+}
+
 app.post("/analyze-barcode", async (req, res) => {
   try {
-    const barcode = String(req.body?.barcode || "").trim();
-    if (!barcode) return res.status(400).json({ error: "Barcode is missing" });
+    const rawCode = String(req.body?.barcode || "").trim();
+    const barcode = normalizeScannedProductCode(rawCode);
+    if (!barcode) return res.status(400).json({ error: "Barcode or QR code is missing" });
     const offResult = await openFoodFactsByBarcode(barcode);
     if (offResult) return res.json(offResult);
     if (!requireApiKey(res)) return;
@@ -533,9 +565,9 @@ app.post("/analyze-nutrition-label", upload.single("image"), async (req, res) =>
   }
 });
 
-app.get("/", (req, res) => res.json({ status: "ok", service: "nutrition-ai-server", version: "metric-meal-v19-saved-meals-sleep-leftovers", model: process.env.OPENAI_MODEL || "gpt-5.4-mini", cache_enabled: CACHE_ENABLED, cached_analyses: Object.keys(analysisCache).length, rule: "ChatGPT analyzes every image/text meal. Identical input is cached and reused so repeated analysis of the same meal does not change values.", endpoints: ["/analyze-meal", "/analyze-text-meal", "/analyze-barcode", "/analyze-nutrition-label", "/generate-meal-image", "/clear-cache"] }));
+app.get("/", (req, res) => res.json({ status: "ok", service: "nutrition-ai-server", version: "metric-meal-v23-meals-images-qr-overview", model: process.env.OPENAI_MODEL || "gpt-5.4-mini", cache_enabled: CACHE_ENABLED, cached_analyses: Object.keys(analysisCache).length, rule: "ChatGPT analyzes every image/text meal. Identical input is cached and reused so repeated analysis of the same meal does not change values.", endpoints: ["/analyze-meal", "/analyze-text-meal", "/analyze-barcode", "/analyze-nutrition-label", "/generate-meal-image", "/clear-cache"] }));
 app.post("/clear-cache", (req, res) => { analysisCache = {}; saveCache(); res.json({ status: "ok", cleared: true }); });
 app.post("/analyze-meal", upload.single("image"), async (req, res) => { try { if (!requireApiKey(res)) return; if (!req.file) return res.status(400).json({ error: "No image uploaded" }); const result = await analyzeImageWithChatGpt({ base64Image: req.file.buffer.toString("base64"), mimeType: detectImageMimeType(req.file.buffer, req.file.originalname) }); return res.json(result); } catch (error) { console.error("analyze-meal failed:", error); return res.status(500).json({ error: "Failed to analyze meal image with ChatGPT", details: error.message }); } });
 app.post("/analyze-text-meal", async (req, res) => { try { if (!requireApiKey(res)) return; const mealName = String(req.body?.meal_name || "ארוחה ידנית"); const items = Array.isArray(req.body?.items) ? req.body.items : []; if (items.length === 0) return res.status(400).json({ error: "No food items provided" }); const result = await analyzeTextMealWithChatGpt({ mealName, items }); return res.json(result); } catch (error) { console.error("analyze-text-meal failed:", error); return res.status(500).json({ error: "Failed to analyze text meal with ChatGPT", details: error.message }); } });
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`Nutrition AI server v19 is running on port ${port}`));
+app.listen(port, () => console.log(`Nutrition AI server v23 is running on port ${port}`));
