@@ -164,8 +164,10 @@ function buildMealImagePrompt({ mealName, description, items }) {
 Create a realistic, appetizing, high-quality smartphone food photo of the EXACT meal described below.
 
 Critical requirements:
+- Treat "Original user description" as the authoritative source. If analyzed items conflict with it, follow the original description.
 - The image must match the actual user-provided meal, not a generic healthy salad or random plate.
 - Include the specific foods named in Hebrew/English in the description and items.
+- Correctly interpret Hebrew food names. For example, גלידה means ice cream and must produce ice cream, not another dish.
 - Respect the approximate quantities and presentation implied by the items.
 - If the meal is simple or homemade, make it look like a real homemade plate.
 - If the user mentioned Israeli/Middle Eastern foods, reflect that food style accurately.
