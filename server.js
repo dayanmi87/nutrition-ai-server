@@ -93,6 +93,7 @@ function normalizeMealResult(parsed, fallbackName = "ארוחה") {
   const items = Array.isArray(parsed?.items) ? parsed.items.map(normalizeItem) : [];
   const totals = items.reduce((s, i) => ({ calories: s.calories + i.calories, protein: s.protein + i.protein, fat: s.fat + i.fat, carbs: s.carbs + i.carbs }), { calories: 0, protein: 0, fat: 0, carbs: 0 });
   return {
+    recognized: parsed?.recognized !== false,
     meal_name: String(parsed?.meal_name || fallbackName).trim(),
     calories: Math.round(totals.calories),
     protein: round1(totals.protein),
@@ -121,12 +122,13 @@ function systemPrompt() { return `אתה מנוע תזונה קליני בתוך
 3. אל תשנה הערכה סתם בין ניתוחים. בחר ערך נקודתי אחד וסביר, לא טווח.
 4. אם מדובר במוצר/מנה מוכרים, השתמש בערכים תזונתיים מקובלים למוצר ולגודל מנה מקובל.
 5. אם מדובר בתמונה, זהה את כל הרכיבים הנראים והערך כמות לכל רכיב.
-6. אם אינך בטוח, תן אומדן שמרני ומציאותי וציין את ההנחה ב-notes.
+6. אם יש מזון מזוהה אך הכמות אינה ודאית, תן אומדן שמרני ומציאותי וציין את ההנחה ב-notes.
+6א. אם לא ניתן לזהות מזון בתמונה, החזר recognized=false, items=[] וכל הערכים 0. אל תנחש מנה שאינה נראית.
 7. totals חייבים להיות סכום items בלבד.
 8. התשובה בעברית.
 כללי בסיס: סקופ אבקת חלבון 30 גרם כ-120 קלוריות וכ-24 גרם חלבון; ביצה רגילה כ-70 קלוריות וכ-6 גרם חלבון; כף שמן כ-120 קלוריות וכ-14 גרם שומן; עוגיית אוראו אחת כ-50-55 קלוריות; במבה 25 גרם כ-130-140 קלוריות.
 מבנה JSON חובה:
-{"meal_name":"string","calories":0,"protein":0,"fat":0,"carbs":0,"confidence":"low|medium|high","notes":"string","items":[{"name":"string","quantity":1,"unit":"string","calories":0,"protein":0,"fat":0,"carbs":0,"confidence":"low|medium|high","notes":"string"}]}`; }
+{"recognized":true,"meal_name":"string","calories":0,"protein":0,"fat":0,"carbs":0,"confidence":"low|medium|high","notes":"string","items":[{"name":"string","quantity":1,"unit":"string","calories":0,"protein":0,"fat":0,"carbs":0,"confidence":"low|medium|high","notes":"string"}]}`; }
 async function createResponse(input) {
   const payload = { model: process.env.OPENAI_MODEL || "gpt-5.4-mini", input };
   if (process.env.OPENAI_TEMPERATURE !== undefined) payload.temperature = Number(process.env.OPENAI_TEMPERATURE);
