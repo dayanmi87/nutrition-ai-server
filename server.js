@@ -92,8 +92,13 @@ function normalizeItem(item) {
 function normalizeMealResult(parsed, fallbackName = "ארוחה") {
   const items = Array.isArray(parsed?.items) ? parsed.items.map(normalizeItem) : [];
   const totals = items.reduce((s, i) => ({ calories: s.calories + i.calories, protein: s.protein + i.protein, fat: s.fat + i.fat, carbs: s.carbs + i.carbs }), { calories: 0, protein: 0, fat: 0, carbs: 0 });
+  const hasUsefulItem = items.some((item) =>
+    item.name &&
+    item.name !== "רכיב מזון" &&
+    (item.calories > 0 || item.protein > 0 || item.fat > 0 || item.carbs > 0)
+  );
   return {
-    recognized: parsed?.recognized !== false,
+    recognized: parsed?.recognized !== false && hasUsefulItem,
     meal_name: String(parsed?.meal_name || fallbackName).trim(),
     calories: Math.round(totals.calories),
     protein: round1(totals.protein),
@@ -109,6 +114,17 @@ function normalizeMealResult(parsed, fallbackName = "ארוחה") {
     values_basis: String(parsed?.values_basis || "").trim(),
     needs_package_size: parsed?.needs_package_size === true,
   };
+}
+function hasUsableNutritionResult(result) {
+  return result?.recognized === true &&
+    Array.isArray(result.items) &&
+    result.items.some((item) =>
+      String(item?.name || "").trim() &&
+      (toNumber(item?.calories) > 0 ||
+        toNumber(item?.protein) > 0 ||
+        toNumber(item?.fat) > 0 ||
+        toNumber(item?.carbs) > 0)
+    );
 }
 function withCacheMeta(result, cacheKey, cacheHit) {
   return { ...result, cache_key: cacheKey, cache_hit: cacheHit, notes: `${result.notes || ""}${cacheHit ? " | תוצאה זהה נשלפה מהמטמון כדי למנוע שינוי בין ניתוחים חוזרים." : " | תוצאה חדשה נשמרה במטמון כדי שבניתוח חוזר לאותם נתונים הערכים יישארו קבועים."}`.trim() };
@@ -137,8 +153,41 @@ async function createResponse(input) {
 async function analyzeImageWithChatGpt({ base64Image, mimeType }) {
   const cacheKey = `image:${hashValue(base64Image)}`;
   if (analysisCache[cacheKey]) return withCacheMeta(analysisCache[cacheKey], cacheKey, true);
-  const response = await createResponse([{ role: "system", content: [{ type: "input_text", text: systemPrompt() }] }, { role: "user", content: [{ type: "input_text", text: "נתח את התמונה כארוחה מלאה. זהה רכיבים, הערך כמות לכל רכיב, חשב קלוריות/חלבון/שומן/פחמימות לכל רכיב ולכל הארוחה. בחר הערכה נקודתית אחת ואל תחזיר טווח. החזר JSON בלבד." }, { type: "input_image", image_url: `data:${mimeType};base64,${base64Image}` }] }]);
-  const result = normalizeMealResult(await parseJsonFromAi(response), "ארוחה מצולמת");
+  const request = (extraInstruction = "") => createResponse([
+    { role: "system", content: [{ type: "input_text", text: systemPrompt() }] },
+    {
+      role: "user",
+      content: [
+        {
+          type: "input_text",
+          text: `נתח את התמונה כארוחה מלאה. זהה רכיבים, הערך כמות לכל רכיב, חשב קלוריות/חלבון/שומן/פחמימות לכל רכיב ולכל הארוחה. בחר הערכה נקודתית אחת ואל תחזיר טווח. החזר JSON בלבד. ${extraInstruction}`.trim(),
+        },
+        { type: "input_image", image_url: `data:${mimeType};base64,${base64Image}` },
+      ],
+    },
+  ]);
+  let result = normalizeMealResult(await parseJsonFromAi(await request()), "ארוחה מצולמת");
+  if (!hasUsableNutritionResult(result)) {
+    result = normalizeMealResult(
+      await parseJsonFromAi(
+        await request("זהו ניסיון אימות נוסף. אם נראה מזון, חובה להחזיר לפחות רכיב מזוהה אחד עם ערכים תזונתיים מציאותיים. אם לא נראה מזון, החזר recognized=false."),
+      ),
+      "ארוחה מצולמת",
+    );
+  }
+  if (!hasUsableNutritionResult(result)) {
+    return {
+      recognized: false,
+      meal_name: "לא זוהה מזון",
+      calories: 0,
+      protein: 0,
+      fat: 0,
+      carbs: 0,
+      confidence: "low",
+      notes: "לא ניתן היה לזהות מזון בתמונה באופן אמין.",
+      items: [],
+    };
+  }
   analysisCache[cacheKey] = result; saveCache(); return withCacheMeta(result, cacheKey, false);
 }
 function buildTextMealPrompt(mealName, items) {
@@ -149,8 +198,38 @@ async function analyzeTextMealWithChatGpt({ mealName, items }) {
   const normalizedItems = normalizeInputItems(items);
   const cacheKey = `text:${hashValue(stableStringify({ mealName: normalizeName(mealName), items: normalizedItems }))}`;
   if (analysisCache[cacheKey]) return withCacheMeta(analysisCache[cacheKey], cacheKey, true);
-  const response = await createResponse([{ role: "system", content: [{ type: "input_text", text: systemPrompt() }] }, { role: "user", content: [{ type: "input_text", text: buildTextMealPrompt(mealName, items) }] }]);
-  const result = normalizeMealResult(await parseJsonFromAi(response), mealName);
+  const prompt = buildTextMealPrompt(mealName, items);
+  let response = await createResponse([
+    { role: "system", content: [{ type: "input_text", text: systemPrompt() }] },
+    { role: "user", content: [{ type: "input_text", text: prompt }] },
+  ]);
+  let result = normalizeMealResult(await parseJsonFromAi(response), mealName);
+  if (!hasUsableNutritionResult(result)) {
+    response = await createResponse([
+      { role: "system", content: [{ type: "input_text", text: systemPrompt() }] },
+      {
+        role: "user",
+        content: [{
+          type: "input_text",
+          text: `${prompt}\n\nזהו ניסיון אימות נוסף: הקלט הוא מזון שהמשתמש אכל. חובה לאמוד מנה מקובלת ולהחזיר לכל רכיב קלוריות, חלבון, שומן ופחמימות שאינם כולם אפס. לדוגמה, "קציצת ירק" היא קציצה אכילה ויש לאמוד את ערכיה לפי הכמות שניתנה.`,
+        }],
+      },
+    ]);
+    result = normalizeMealResult(await parseJsonFromAi(response), mealName);
+  }
+  if (!hasUsableNutritionResult(result)) {
+    return {
+      recognized: false,
+      meal_name: String(mealName || "ארוחה ידנית"),
+      calories: 0,
+      protein: 0,
+      fat: 0,
+      carbs: 0,
+      confidence: "low",
+      notes: "לא ניתן היה לחשב ערכים תזונתיים אמינים.",
+      items: [],
+    };
+  }
   analysisCache[cacheKey] = result; saveCache(); return withCacheMeta(result, cacheKey, false);
 }
 
@@ -183,6 +262,53 @@ Analyzed meal items: ${itemText || ""}
 `.trim();
 }
 
+async function generateMealImageCandidate(prompt) {
+  const image = await client.images.generate({
+    model: process.env.OPENAI_IMAGE_MODEL || "gpt-image-1",
+    prompt,
+    n: 1,
+    size: "1024x1024",
+    quality: process.env.OPENAI_IMAGE_QUALITY || "low",
+    output_format: "jpeg",
+  });
+  return image?.data?.[0] || {};
+}
+
+async function verifyMealImage({ candidate, mealName, description, items }) {
+  const imageUrl = candidate.b64_json
+    ? `data:image/jpeg;base64,${candidate.b64_json}`
+    : candidate.url;
+  if (!imageUrl) return { matches: false, issues: "No image was generated." };
+  const expectedItems = (Array.isArray(items) ? items : [])
+    .map((item) => `${item.name || ""} ${item.quantity || ""} ${item.unit || ""}`.trim())
+    .filter(Boolean)
+    .join(", ");
+  const response = await createResponse([
+    {
+      role: "system",
+      content: [{
+        type: "input_text",
+        text: "You verify food-image accuracy. Return JSON only: {\"matches\":true|false,\"issues\":\"short correction\"}. Mark matches=false if the visible food type conflicts with or omits a central food named by the user. Ignore plating style and background.",
+      }],
+    },
+    {
+      role: "user",
+      content: [
+        {
+          type: "input_text",
+          text: `Expected meal name: ${mealName}\nAuthoritative description: ${description}\nExpected items: ${expectedItems}`,
+        },
+        { type: "input_image", image_url: imageUrl },
+      ],
+    },
+  ]);
+  const parsed = await parseJsonFromAi(response);
+  return {
+    matches: parsed?.matches === true,
+    issues: String(parsed?.issues || "").trim(),
+  };
+}
+
 app.post("/generate-meal-image", async (req, res) => {
   try {
     if (!requireApiKey(res)) return;
@@ -191,17 +317,32 @@ app.post("/generate-meal-image", async (req, res) => {
     const description = String(req.body?.description || "");
     const items = Array.isArray(req.body?.items) ? req.body.items : [];
     const prompt = buildMealImagePrompt({ mealName, description, items });
-
-    const image = await client.images.generate({
-      model: process.env.OPENAI_IMAGE_MODEL || "gpt-image-1",
-      prompt,
-      n: 1,
-      size: "1024x1024",
-      quality: process.env.OPENAI_IMAGE_QUALITY || "low",
-      output_format: "jpeg",
+    let first = await generateMealImageCandidate(prompt);
+    let verification = await verifyMealImage({
+      candidate: first,
+      mealName,
+      description,
+      items,
     });
-
-    const first = image?.data?.[0] || {};
+    if (!verification.matches) {
+      first = await generateMealImageCandidate(
+        `${prompt}\n\nThe previous image failed visual verification. Correct these issues exactly: ${verification.issues || "The visible food did not match the description."}`,
+      );
+      verification = await verifyMealImage({
+        candidate: first,
+        mealName,
+        description,
+        items,
+      });
+    }
+    if (!verification.matches) {
+      return res.json({
+        status: "no_accurate_image",
+        image_base64: "",
+        image_url: "",
+        source: "neutral_placeholder_required",
+      });
+    }
     return res.json({
       status: "ok",
       image_base64: first.b64_json || "",
@@ -569,9 +710,9 @@ app.post("/analyze-nutrition-label", upload.single("image"), async (req, res) =>
   }
 });
 
-app.get("/", (req, res) => res.json({ status: "ok", service: "nutrition-ai-server", version: "metric-meal-v23-meals-images-qr-overview", model: process.env.OPENAI_MODEL || "gpt-5.4-mini", cache_enabled: CACHE_ENABLED, cached_analyses: Object.keys(analysisCache).length, rule: "ChatGPT analyzes every image/text meal. Identical input is cached and reused so repeated analysis of the same meal does not change values.", endpoints: ["/analyze-meal", "/analyze-text-meal", "/analyze-barcode", "/analyze-nutrition-label", "/generate-meal-image", "/clear-cache"] }));
+app.get("/", (req, res) => res.json({ status: "ok", service: "nutrition-ai-server", version: "metric-meal-v24-calendar-sync-accurate-images", model: process.env.OPENAI_MODEL || "gpt-5.4-mini", cache_enabled: CACHE_ENABLED, cached_analyses: Object.keys(analysisCache).length, rule: "ChatGPT analyzes every image/text meal. Identical input is cached and reused so repeated analysis of the same meal does not change values.", endpoints: ["/analyze-meal", "/analyze-text-meal", "/analyze-barcode", "/analyze-nutrition-label", "/generate-meal-image", "/clear-cache"] }));
 app.post("/clear-cache", (req, res) => { analysisCache = {}; saveCache(); res.json({ status: "ok", cleared: true }); });
 app.post("/analyze-meal", upload.single("image"), async (req, res) => { try { if (!requireApiKey(res)) return; if (!req.file) return res.status(400).json({ error: "No image uploaded" }); const result = await analyzeImageWithChatGpt({ base64Image: req.file.buffer.toString("base64"), mimeType: detectImageMimeType(req.file.buffer, req.file.originalname) }); return res.json(result); } catch (error) { console.error("analyze-meal failed:", error); return res.status(500).json({ error: "Failed to analyze meal image with ChatGPT", details: error.message }); } });
 app.post("/analyze-text-meal", async (req, res) => { try { if (!requireApiKey(res)) return; const mealName = String(req.body?.meal_name || "ארוחה ידנית"); const items = Array.isArray(req.body?.items) ? req.body.items : []; if (items.length === 0) return res.status(400).json({ error: "No food items provided" }); const result = await analyzeTextMealWithChatGpt({ mealName, items }); return res.json(result); } catch (error) { console.error("analyze-text-meal failed:", error); return res.status(500).json({ error: "Failed to analyze text meal with ChatGPT", details: error.message }); } });
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`Nutrition AI server v23 is running on port ${port}`));
+app.listen(port, () => console.log(`Nutrition AI server v24 is running on port ${port}`));
